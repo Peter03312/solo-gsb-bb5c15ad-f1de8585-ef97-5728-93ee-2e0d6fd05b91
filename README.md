@@ -544,7 +544,9 @@ curl -s $BASE/seal-releases/<release_id>               # 按凭证号查询（�
 1. **逐港**：按卸港序号从小到大，每个卸箱位置只允许卸下属于该港的箱（每港只卸该港箱）；
 2. **堆栈先后**：同堆栈上层箱未卸时不得取下下层箱（按配载方案已占用层自底向上的连续链）；
 3. **逐步剩余总力矩**：每卸一箱后，以该方案箱重与槽位力臂重算
-   `剩余总力矩 = 初始总力矩 − Σ已卸(箱重 × 纵向力臂)`，结果必须落入**该箱所属卸港**的允许闭区间；全部卸完后剩余力矩恒为 0（故末港区间必须包含 0）。
+   `剩余总力矩 = 初始总力矩 − Σ已卸(箱重 × 纵向力臂)`，结果必须落入**该箱所属卸港**的允许闭区间
+   （按 6 位小数登记值**严格判定**，不随力矩量级放大容差；越出端点的步骤不算可行，恰在端点上仍通过）；
+   全部卸完后剩余力矩恒为 0（故末港区间必须包含 0）。
 
 ### 优选规则
 
@@ -624,8 +626,12 @@ curl -s $BASE/plans/<plan_id>/unloading
 1. **无当前卸箱计划则拒绝**（`409`）：须先生成第六章的逐港卸箱顺序；方案 `draft`/`superseded` 同样 `409`；
 2. **当前港**取剩余箱中最小卸港序号；所选箱须**属于当前港**（否则 `422`）；
 3. 所选箱须位于其堆栈**剩余箱的最上层**（同堆栈上层未卸不得取下下层，否则 `422`）；
-4. 卸后**剩余总力矩须落入该港原定闭区间**（`剩余总力矩 = 上次剩余 − 箱重 × 力臂`，否则 `422`）；
+4. 卸后**剩余总力矩须落入该港当前生效闭区间**（`剩余总力矩 = 上次剩余 − 箱重 × 力臂`，否则 `422`）：
+   对 6 位小数登记值**严格按闭区间判定，不随剩余力矩量级放大容差**——越出端点即拒绝
+   （如剩余 1000000000、区间 `[999999950, 1000000000]` 时卸力矩 −50 的箱得到 1000000050，拒绝登记），
+   恰在端点上（剩余力矩等于下界或上界）仍通过；
 5. **前瞻可行性**：只有从新状态仍能按**港序、堆栈先后与各港力矩区间**卸完全部剩余箱时才登记；
+   前瞻推荐同样按生效闭区间严格判定，**越界步骤不算可行**；
    所选箱即时合法但走入死局时返回 `422`，响应体随附 `blocked_reason`（求解器给出的中文阻碍原因）、
    `current_port`、`remaining_moment_after`，**说明阻碍且进度不变**。
 
@@ -677,6 +683,59 @@ curl -s -X POST $BASE/plans/<plan_id>/unloading/execute \
 curl -s $BASE/plans/<plan_id>/unloading/execution
 ```
 
+### 本轮调用示例（剩余力矩边界严格判定）
+
+请求字段、响应结构与错误状态不变；变化在于卸箱登记与区间收紧的边界判定
+**不再按剩余力矩量级放大容差**：实际剩余力矩（6 位小数登记值）必须落在生效闭区间
+`[min_remaining_moment, max_remaining_moment]` 内，新区间必须包含于原生效区间；
+越界拒绝（`422`）且步骤、进度版本与调整历史不变，合法端点仍可通过。
+
+```bash
+BASE=http://127.0.0.1:8000/api
+
+# 配载：C-A1(50,臂1,港1)、C-A2(50,臂-1,港1)、C-B(100,臂1e7,港2)，初始总力矩 1e9
+curl -s -X POST $BASE/slot-revisions -H 'Content-Type: application/json' -d '{
+  "slots": [{"code":"A1","stack":"A","tier":1,"capacity":100,"arm":1.0},
+            {"code":"B1","stack":"B","tier":1,"capacity":100,"arm":-1.0},
+            {"code":"C1","stack":"C","tier":1,"capacity":200,"arm":10000000.0}],
+  "adjacency": [], "incompatible_classes": [],
+  "min_moment": -2000000000, "max_moment": 2000000000}'
+curl -s -X POST $BASE/manifest-revisions -H 'Content-Type: application/json' -d '{
+  "containers": [{"no":"C-A1","weight":50,"hazmat":null,"discharge_order":1},
+                 {"no":"C-A2","weight":50,"hazmat":null,"discharge_order":1},
+                 {"no":"C-B","weight":100,"hazmat":null,"discharge_order":2}]}'
+curl -s -X POST $BASE/plans/compute -H 'Content-Type: application/json' -d '{}'
+curl -s -X POST $BASE/plans/<plan_id>/confirm -H 'Content-Type: application/json' \
+  -d '{"slots_revision":1,"manifest_revision":1}'
+
+# 港1 区间 [999999950, 1000000000]，港2 区间含 0；预案 C-A1→C-A2→C-B 全程恰走端点
+curl -s -X POST $BASE/plans/<plan_id>/unloading -H 'Content-Type: application/json' -d '{
+  "ports": [{"discharge_order":1,"min_remaining_moment":999999950,"max_remaining_moment":1000000000},
+            {"discharge_order":2,"min_remaining_moment":0,"max_remaining_moment":1000000000}]}'
+
+# 越界拒绝：先卸力矩 -50 的 C-A2 得剩余 1000000050 > 上界 1000000000
+# -> 422「不在当前港……生效允许区间……内」，步骤/进度版本/调整历史不变
+curl -s -X POST $BASE/plans/<plan_id>/unloading/execute -H 'Content-Type: application/json' \
+  -d '{"container_no":"C-A2","operation_no":"OP-BAD","expected_version":0}'
+
+# 合法端点通过：卸 C-A1 剩余恰为下界 999999950（201）；再卸 C-A2 剩余恰为上界 1000000000（201）
+curl -s -X POST $BASE/plans/<plan_id>/unloading/execute -H 'Content-Type: application/json' \
+  -d '{"container_no":"C-A1","operation_no":"OP-1","expected_version":0}'
+curl -s -X POST $BASE/plans/<plan_id>/unloading/execute -H 'Content-Type: application/json' \
+  -d '{"container_no":"C-A2","operation_no":"OP-2","expected_version":1}'
+
+# 区间收紧：新区间上界 1000000050 越出生效上界 -> 422「未包含于当前生效区间」；
+# 调整后当前港区间不含当前剩余力矩（如上界 999999999 < 1000000000）-> 422；
+# 端点重合的收紧（[0, 1000000000]）合法 -> 201，区间版本 +1
+curl -s -X POST $BASE/plans/<plan_id>/unloading/window-adjustments \
+  -H 'Content-Type: application/json' -d '{
+    "application_no":"ADJ-1","expected_progress_version":2,"expected_window_version":0,
+    "ports":[{"discharge_order":2,"min_remaining_moment":0,"max_remaining_moment":1000000050}]}'
+
+# 前瞻推荐：执行视图 recommendation 的每步剩余力矩均落在生效闭区间内（越界不算可行）
+curl -s $BASE/plans/<plan_id>/unloading/execution
+```
+
 ## 六之二、收紧剩余力矩安全区间（执行中调整申请）
 
 卸箱执行过程中港口需要收紧剩余力矩安全区间时，可对**已开始且未完结**的已确认方案提交
@@ -699,8 +758,9 @@ curl -s $BASE/plans/<plan_id>/unloading/execution
 2. **不得改已完成港**：每个区间的卸港序号须 ≥ 当前港（剩余箱中最小卸港序号），且属于本方案卸港；
    修改已完成港返回 `422`；
 3. 每个新闭区间**上下界须为有限数值**（不得为 `NaN`/`Infinity`/`-Infinity`）且**下界不大于上界**；
-4. 新区间必须**包含于该港当前生效区间**（只能收紧，不能放宽或平移出界），否则 `422`；
-5. **当前剩余总力矩须落入调整后的当前港区间**（收紧不得否决现状），否则 `422`；
+4. 新区间必须**包含于该港当前生效区间**（只能收紧，不能放宽或平移出界），否则 `422`：
+   **严格判定，不随量级放大容差**——闭区间端点重合合法，越出端点（哪怕 1 个单位）即拒绝；
+5. **当前剩余总力矩须落入调整后的当前港区间**（严格按闭区间判定，收紧不得否决现状），否则 `422`；
 6. **可完成性验证**：依据首次执行冻结的**箱重、槽位力臂与堆栈**，从当前**未卸箱**验证仍能按
    **港序、栈顶规则（同堆栈上层先卸）与逐步新区间**卸完全部剩余箱（MILP，全程箱号字典序规则
    同“六之一”）；**无解返回中文原因且不生效**（`422`，响应体 `detail` 含 `无解原因：...`）。

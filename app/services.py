@@ -40,7 +40,6 @@ from app.solver import (
     solve_stowage,
 )
 from app.unloader import (
-    EPS as UNLOAD_EPS,
     InfeasibleUnloading,
     PlacedContainer,
     PortWindow,
@@ -1641,12 +1640,11 @@ def _register_unloading_step(
             422,
         )
 
-    # 卸后剩余总力矩须落入该港当前生效闭区间（容差随量级缩放，与求解器一致）
+    # 卸后剩余总力矩须落入该港当前生效闭区间：对登记值（6 位小数）按闭区间
+    # 严格判定，不按剩余力矩量级放大容差——越出端点即拒绝，恰在端点上仍通过
     new_remaining_moment = round(remaining_moment - chosen[4] * chosen[5], 6)
     wmin, wmax = window_by_order[current_port][1], window_by_order[current_port][2]
-    scale = max(1.0, abs(remaining_moment), abs(wmin), abs(wmax))
-    if not (wmin - UNLOAD_EPS * scale <= new_remaining_moment
-            <= wmax + UNLOAD_EPS * scale):
+    if not (wmin <= new_remaining_moment <= wmax):
         raise BusinessError(
             f"卸下 {container_no} 后剩余总力矩 {new_remaining_moment} 不在当前港"
             f"（卸港序号 {current_port}）当前生效允许区间 [{wmin}, {wmax}] 内，"
@@ -2051,8 +2049,9 @@ def _apply_window_adjustment(
                 422,
             )
         _, emin, emax = effective[d]
-        scale = max(1.0, abs(emin), abs(emax), abs(nmin), abs(nmax))
-        if nmin < emin - UNLOAD_EPS * scale or nmax > emax + UNLOAD_EPS * scale:
+        # 新区间必须包含于当前生效区间（闭区间，端点重合合法）：严格判定，
+        # 不按量级放大容差——任何越出原生效区间端点的新区间都拒绝
+        if nmin < emin or nmax > emax:
             raise BusinessError(
                 f"卸港 {d} 的新区间 [{nmin}, {nmax}] 未包含于当前生效区间 "
                 f"[{emin}, {emax}]（只可收紧），本次调整被拒绝且不生效",
@@ -2076,14 +2075,11 @@ def _apply_window_adjustment(
             max_remaining_moment=w["max_remaining_moment"],
         )
 
-    # 当前剩余力矩须落入调整后的当前港区间（显式核对，保证收紧不否决现状）
+    # 当前剩余力矩须落入调整后的当前港区间（显式核对，保证收紧不否决现状）：
+    # 对登记值按闭区间严格判定，不放量差
     cur = adjusted[current_port]
-    cscale = max(
-        1.0, abs(remaining_moment),
-        abs(cur.min_remaining_moment), abs(cur.max_remaining_moment),
-    )
-    if not (cur.min_remaining_moment - UNLOAD_EPS * cscale <= remaining_moment
-            <= cur.max_remaining_moment + UNLOAD_EPS * cscale):
+    if not (cur.min_remaining_moment <= remaining_moment
+            <= cur.max_remaining_moment):
         raise BusinessError(
             "调整后当前港（卸港序号 "
             f"{current_port}）区间 [{cur.min_remaining_moment}, "

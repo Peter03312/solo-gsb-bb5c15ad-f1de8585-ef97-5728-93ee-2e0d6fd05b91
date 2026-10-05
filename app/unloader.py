@@ -98,10 +98,10 @@ def _prechecks(
 ) -> None:
     """MILP 前的快速可行性预检，给出明确中文原因。"""
     m0 = sum(b.weight * b.arm for b in boxes)
-    # 全部卸完后剩余力矩恒为 0：最后一个卸港的区间必须包含 0
+    # 全部卸完后剩余力矩恒为 0：最后一个卸港的区间必须包含 0（严格判定）
     last_order = max(windows)
     last = windows[last_order]
-    if not (last.min_remaining_moment - EPS <= 0.0 <= last.max_remaining_moment + EPS):
+    if not (last.min_remaining_moment <= 0.0 <= last.max_remaining_moment):
         raise InfeasibleUnloading(
             f"全部箱卸完后剩余总力矩为 0，不在末港（卸港序号 {last_order}）"
             f"的允许区间 [{last.min_remaining_moment}, "
@@ -139,7 +139,9 @@ def _prechecks(
                 moment[x.no] for x in optional if moment[x.no] < 0
             )
             w = windows[b.discharge_order]
-            if r_max < w.min_remaining_moment - EPS or r_min > w.max_remaining_moment + EPS:
+            # 按 6 位小数登记值严格判定相交性：越出端点即不相交，端点重合合法
+            if (round(r_max, 6) < w.min_remaining_moment
+                    or round(r_min, 6) > w.max_remaining_moment):
                 raise InfeasibleUnloading(
                     f"箱 {b.no}（卸港 {b.discharge_order}）受堆栈 {b.stack} "
                     "上层箱先后限制，其卸下时剩余总力矩只能处于 "
@@ -282,7 +284,7 @@ def solve_unloading(
             f"卸港序号重复提交：{', '.join(map(str, sorted(dup)))}"
         )
     for w in windows:
-        if w.min_remaining_moment > w.max_remaining_moment + EPS:
+        if w.min_remaining_moment > w.max_remaining_moment:
             raise InfeasibleUnloading(
                 f"卸港 {w.discharge_order} 的允许剩余力矩区间下限 "
                 f"{w.min_remaining_moment} 高于上限 {w.max_remaining_moment}"
@@ -415,16 +417,17 @@ def solve_unloading(
             )
 
     steps: list[UnloadStep] = []
-    remaining = initial_moment
+    # 逐步剩余力矩按 6 位小数登记值累计（与现场登记口径一致），并对生效闭区间
+    # 严格判定：不放量差，越出端点的步骤不得算作可行，恰在端点上仍通过
+    remaining = round(initial_moment, 6)
     for p, b in enumerate(assigned):
         if b.discharge_order != port_of_position[p]:
             raise InfeasibleUnloading(
                 f"求解结果第 {p + 1} 步卸下了非本港箱 {b.no}，请重试"
             )
-        remaining -= b.weight * b.arm
+        remaining = round(remaining - b.weight * b.arm, 6)
         w = original_windows[port_of_position[p]]
-        if not (w.min_remaining_moment - EPS
-                <= remaining <= w.max_remaining_moment + EPS):
+        if not (w.min_remaining_moment <= remaining <= w.max_remaining_moment):
             raise InfeasibleUnloading(
                 f"求解结果第 {p + 1} 步卸下 {b.no} 后剩余总力矩 "
                 f"{round(remaining, 6)} 不在卸港 {b.discharge_order} 的允许区间 "
@@ -439,11 +442,11 @@ def solve_unloading(
                 tier=b.tier,
                 weight=b.weight,
                 arm=b.arm,
-                remaining_moment=round(remaining, 6),
+                remaining_moment=remaining,
             )
         )
     return UnloadResult(
         steps=steps,
         initial_moment=round(initial_moment, 6),
-        final_moment=round(remaining, 6),
+        final_moment=remaining,
     )
