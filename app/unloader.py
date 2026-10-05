@@ -24,6 +24,14 @@ import pulp
 
 # 浮点比较/边界容差
 EPS = 1e-7
+# 边界判定（闭区间归属、区间包含）使用的固定绝对容差：
+# 力矩一律按 6 位小数量化存储，故 1e-6 足以容纳浮点舍入噪声；
+# 绝不按剩余力矩量级放大（1e9 量级时 EPS*scale 会放宽到约 100，
+# 把越过闭区间数十个单位的现场步骤误判为合法）。
+BOUND_EPS = 1e-6
+# CBC 约束的固定数值松弛（绝对量）：仅用于抵消其双精度内部容差。
+# 最终以 Python 侧逐值复核为准（见 solve_unloading），不随量级放大。
+SOLVER_EPS = 1e-7
 # 单次 CBC 求解时间上限（秒）
 TIME_LIMIT = 30
 
@@ -101,7 +109,8 @@ def _prechecks(
     # 全部卸完后剩余力矩恒为 0：最后一个卸港的区间必须包含 0
     last_order = max(windows)
     last = windows[last_order]
-    if not (last.min_remaining_moment - EPS <= 0.0 <= last.max_remaining_moment + EPS):
+    if not (last.min_remaining_moment - BOUND_EPS <= 0.0
+            <= last.max_remaining_moment + BOUND_EPS):
         raise InfeasibleUnloading(
             f"全部箱卸完后剩余总力矩为 0，不在末港（卸港序号 {last_order}）"
             f"的允许区间 [{last.min_remaining_moment}, "
@@ -139,7 +148,8 @@ def _prechecks(
                 moment[x.no] for x in optional if moment[x.no] < 0
             )
             w = windows[b.discharge_order]
-            if r_max < w.min_remaining_moment - EPS or r_min > w.max_remaining_moment + EPS:
+            if (r_max < w.min_remaining_moment - BOUND_EPS
+                    or r_min > w.max_remaining_moment + BOUND_EPS):
                 raise InfeasibleUnloading(
                     f"箱 {b.no}（卸港 {b.discharge_order}）受堆栈 {b.stack} "
                     "上层箱先后限制，其卸下时剩余总力矩只能处于 "
@@ -230,13 +240,10 @@ def _build_model(
                 )
 
     # 逐步剩余力矩：R_p = M0 - Σ_{q<=p} Σ_i m_i x[q,i]，
-    # 位置 p 属于港口 port_of_position[p]，须落入该港闭区间
-    scale = max(
-        1.0,
-        abs(initial_moment),
-        *(abs(w.min_remaining_moment) for w in windows.values()),
-        *(abs(w.max_remaining_moment) for w in windows.values()),
-    )
+    # 位置 p 属于港口 port_of_position[p]，须落入该港闭区间。
+    # 仅加固定绝对数值松弛供 CBC 抵消内部容差；不得按力矩量级放大，
+    # 否则 1e9 量级时松弛达上百，会让越过闭区间数十单位的分配被判可行
+    # （Python 侧复核虽会拒绝，但会把本可行的问题误报为不可行）。
     for p in range(n):
         w = windows[port_of_position[p]]
         removed = pulp.lpSum(
@@ -247,11 +254,11 @@ def _build_model(
         # min <= M0 - removed <= max 等价于
         # M0 - max <= removed <= M0 - min（直接以 removed 为左式，边界清晰）
         prob += (
-            removed >= initial_moment - w.max_remaining_moment - EPS * scale,
+            removed >= initial_moment - w.max_remaining_moment - SOLVER_EPS,
             f"moment_min_{p}",
         )
         prob += (
-            removed <= initial_moment - w.min_remaining_moment + EPS * scale,
+            removed <= initial_moment - w.min_remaining_moment + SOLVER_EPS,
             f"moment_max_{p}",
         )
 
@@ -423,8 +430,10 @@ def solve_unloading(
             )
         remaining -= b.weight * b.arm
         w = original_windows[port_of_position[p]]
-        if not (w.min_remaining_moment - EPS
-                <= remaining <= w.max_remaining_moment + EPS):
+        # 权威复核：实际剩余力矩必须严格落入生效闭区间（固定绝对容差，
+        # 仅吸收浮点舍入，不随量级放大），越界一律拒绝保存
+        if not (w.min_remaining_moment - BOUND_EPS
+                <= remaining <= w.max_remaining_moment + BOUND_EPS):
             raise InfeasibleUnloading(
                 f"求解结果第 {p + 1} 步卸下 {b.no} 后剩余总力矩 "
                 f"{round(remaining, 6)} 不在卸港 {b.discharge_order} 的允许区间 "

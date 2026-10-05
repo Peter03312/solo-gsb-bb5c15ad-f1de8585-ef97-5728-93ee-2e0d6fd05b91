@@ -40,7 +40,7 @@ from app.solver import (
     solve_stowage,
 )
 from app.unloader import (
-    EPS as UNLOAD_EPS,
+    BOUND_EPS,
     InfeasibleUnloading,
     PlacedContainer,
     PortWindow,
@@ -1035,6 +1035,21 @@ def _exec_content_hash(operation_no: str, container_no: str, expected_version: i
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _within_closed(value: float, low: float, high: float) -> bool:
+    """闭区间归属判定：value ∈ [low, high]，仅保留固定绝对舍入容差。
+
+    力矩按 6 位小数量化存储，``BOUND_EPS`` 只覆盖浮点舍入噪声；
+    不按剩余力矩/区间边界的量级放大，否则 1e9 量级会松出上百的容差，
+    把越过闭区间的现场操作误记为成功。
+    """
+    return low - BOUND_EPS <= value <= high + BOUND_EPS
+
+
+def _contained(new_low: float, new_high: float, low: float, high: float) -> bool:
+    """新区间 [new_low, new_high] 是否为原生效闭区间 [low, high] 的子区间。"""
+    return new_low >= low - BOUND_EPS and new_high <= high + BOUND_EPS
+
+
 def _remaining_recommendation(remaining, windows_by_order):
     """从当前剩余箱状态求可行的剩余推荐顺序（全程箱号字典序最小）。
 
@@ -1641,12 +1656,11 @@ def _register_unloading_step(
             422,
         )
 
-    # 卸后剩余总力矩须落入该港当前生效闭区间（容差随量级缩放，与求解器一致）
+    # 卸后剩余总力矩必须落入该港当前**生效闭区间**：只保留固定绝对舍入容差，
+    # 不随剩余力矩量级放大（1e9 量级时放大型容差可达上百，会把越界操作记为成功）
     new_remaining_moment = round(remaining_moment - chosen[4] * chosen[5], 6)
     wmin, wmax = window_by_order[current_port][1], window_by_order[current_port][2]
-    scale = max(1.0, abs(remaining_moment), abs(wmin), abs(wmax))
-    if not (wmin - UNLOAD_EPS * scale <= new_remaining_moment
-            <= wmax + UNLOAD_EPS * scale):
+    if not _within_closed(new_remaining_moment, wmin, wmax):
         raise BusinessError(
             f"卸下 {container_no} 后剩余总力矩 {new_remaining_moment} 不在当前港"
             f"（卸港序号 {current_port}）当前生效允许区间 [{wmin}, {wmax}] 内，"
@@ -2051,8 +2065,7 @@ def _apply_window_adjustment(
                 422,
             )
         _, emin, emax = effective[d]
-        scale = max(1.0, abs(emin), abs(emax), abs(nmin), abs(nmax))
-        if nmin < emin - UNLOAD_EPS * scale or nmax > emax + UNLOAD_EPS * scale:
+        if not _contained(nmin, nmax, emin, emax):
             raise BusinessError(
                 f"卸港 {d} 的新区间 [{nmin}, {nmax}] 未包含于当前生效区间 "
                 f"[{emin}, {emax}]（只可收紧），本次调整被拒绝且不生效",
@@ -2076,14 +2089,14 @@ def _apply_window_adjustment(
             max_remaining_moment=w["max_remaining_moment"],
         )
 
-    # 当前剩余力矩须落入调整后的当前港区间（显式核对，保证收紧不否决现状）
+    # 当前剩余力矩必须落入调整后的当前港区间（显式核对，保证收紧不否决现状）；
+    # 固定绝对容差，不随量级放大
     cur = adjusted[current_port]
-    cscale = max(
-        1.0, abs(remaining_moment),
-        abs(cur.min_remaining_moment), abs(cur.max_remaining_moment),
-    )
-    if not (cur.min_remaining_moment - UNLOAD_EPS * cscale <= remaining_moment
-            <= cur.max_remaining_moment + UNLOAD_EPS * cscale):
+    if not _within_closed(
+        remaining_moment,
+        cur.min_remaining_moment,
+        cur.max_remaining_moment,
+    ):
         raise BusinessError(
             "调整后当前港（卸港序号 "
             f"{current_port}）区间 [{cur.min_remaining_moment}, "
